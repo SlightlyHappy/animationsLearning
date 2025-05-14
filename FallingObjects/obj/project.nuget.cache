@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "dgSpecHash": "dC8q1WJn0Uc=",
+  "success": true,
+  "projectFilePath": "D:\\Documents V2.1\\Coding\\Automation\\RedditStoriesVideos\\animationgen\\FallingObjects\\FallingObjects.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\risha\\.nuget\\packages\\aether.physics2d\\1.7.0\\aether.physics2d.1.7.0.nupkg.sha512",
+    "C:\\Users\\risha\\.nuget\\packages\\skiasharp\\3.119.0\\skiasharp.3.119.0.nupkg.sha512",
+    "C:\\Users\\risha\\.nuget\\packages\\skiasharp.nativeassets.macos\\3.119.0\\skiasharp.nativeassets.macos.3.119.0.nupkg.sha512",
+    "C:\\Users\\risha\\.nuget\\packages\\skiasharp.nativeassets.win32\\3.119.0\\skiasharp.nativeassets.win32.3.119.0.nupkg.sha512",
+    "C:\\Users\\risha\\.nuget\\packages\\system.commandline\\2.0.0-beta4.22272.1\\system.commandline.2.0.0-beta4.22272.1.nupkg.sha512"
+  ],
+  "logs": []
+}
