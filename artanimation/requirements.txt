@@ -1,0 +1,9 @@
+pillow
+numpy
+opencv-python
+tqdm
+imageio
+imageio-ffmpeg
+scikit-learn  # For color clustering
+torch         # For GPU acceleration
+torchvision   # For image processing utilities
