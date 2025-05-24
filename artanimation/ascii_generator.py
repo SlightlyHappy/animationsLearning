@@ -57,10 +57,17 @@ except ImportError:
 
 # Import the prerender optimizer when available
 try:
-    from prerender_optimizer import optimize_ascii_frame_generation
+    from prerender_optimizer import optimize_ascii_frame_generation, signal_memory_pressure, clear_cache
     PRERENDER_AVAILABLE = True
 except ImportError:
     PRERENDER_AVAILABLE = False
+
+# Import memory management system
+try:
+    import memory_manager as mm
+    MEMORY_MANAGER_AVAILABLE = True
+except ImportError:
+    MEMORY_MANAGER_AVAILABLE = False
 
 INPUT_DIR = "input_images"
 OUTPUT_FRAMES_DIR = "output_frames"
@@ -143,46 +150,70 @@ def pixels_to_ascii_with_color(image):
     ascii_chars = []
     ascii_colors = []
     
-    # For RTX 4060 with 8GB VRAM, we can use much larger batches
+    # Process the entire image at once using tensors
     # Convert PIL images to PyTorch tensors with optimized dtype
     gray_tensor = torch.tensor(np.array(gray_img), dtype=torch.float16).to(DEVICE)  # Use float16 for memory savings
     color_tensor = torch.tensor(np.array(image), dtype=torch.uint8).to(DEVICE)  # Use uint8 for colors
-      # Process grayscale values in parallel on GPU
+    
+    # Process grayscale values in parallel on GPU
     # Divide by 25 to get character index, using optimized operations
     with torch.amp.autocast(device_type='cuda', enabled=True):  # Use mixed precision for faster processing
         char_indices = (gray_tensor / 25.0).clamp(0, len(ASCII_CHARS) - 1).long()
     
-    # Process in larger batches for better GPU utilization on 8GB VRAM
-    batch_size = 50000  # Much larger batch size for 8GB VRAM
+    # Calculate total pixels and number of newlines
     total_pixels = char_indices.numel()
+    rows = gray_img.height
     
-    # Pre-allocate lists for better performance
-    ascii_chars = [None] * (total_pixels + (total_pixels // width))  # Account for newlines
-    ascii_colors = [None] * (total_pixels + (total_pixels // width))
+    # Pre-allocate arrays on CPU at once (more efficient than dynamic lists)
+    # Pre-calculate the exact size including newlines
+    total_with_newlines = total_pixels + rows - 1  # -1 because the last row doesn't need a newline
     
+    # Use numpy arrays for better performance
+    ascii_chars = np.empty(total_with_newlines, dtype=object)
+    ascii_colors = np.empty(total_with_newlines, dtype=object)
+    
+    # Create a tensor to track where newlines should go
+    # This is much faster than checking % width for each pixel
+    newline_positions = torch.tensor([(i+1) % width == 0 for i in range(total_pixels)], device=DEVICE)
+    
+    # Use larger batch size for improved throughput
+    batch_size = 100000  # Increased batch size for better GPU utilization
+    
+    # Track two indices: one for the input (i) and one for the output with newlines (char_index)
     char_index = 0
+    
+    # Process in batches to avoid GPU memory pressure
     for i in range(0, total_pixels, batch_size):
         end_idx = min(i + batch_size, total_pixels)
-        # Process data in chunks optimized for 8GB VRAM
+        
+        # Process indices and colors in chunks
         batch_indices = char_indices.flatten()[i:end_idx].cpu().numpy()
         batch_colors = color_tensor.reshape(-1, 3)[i:end_idx].cpu().numpy()
+        batch_newlines = newline_positions[i:end_idx].cpu().numpy()
         
-        # Process the batch (string operations must be done on CPU)
-        for b_idx, (char_idx, pixel_color) in enumerate(zip(batch_indices, batch_colors)):
+        # Single loop for processing characters and colors together
+        for b_idx in range(len(batch_indices)):
             idx = i + b_idx
-            ascii_chars[char_index] = ASCII_CHARS[int(char_idx)]
-            ascii_colors[char_index] = tuple(int(c) for c in pixel_color)
+            
+            # Get character and color
+            ascii_chars[char_index] = ASCII_CHARS[int(batch_indices[b_idx])]
+            # Store color as tuple directly (more efficient than tuple comprehension)
+            ascii_colors[char_index] = (
+                int(batch_colors[b_idx][0]),
+                int(batch_colors[b_idx][1]),
+                int(batch_colors[b_idx][2])
+            )
             char_index += 1
             
-            # Add newline if at end of row
-            if ((idx + 1) % width == 0) and (idx < total_pixels - 1):
+            # Add newline if needed and if not at the end of all pixels
+            if batch_newlines[b_idx] and idx < total_pixels - 1:
                 ascii_chars[char_index] = '\n'
                 ascii_colors[char_index] = None  # No color for newlines
                 char_index += 1
     
-    # Trim any unused pre-allocated slots
-    ascii_chars = ascii_chars[:char_index]
-    ascii_colors = ascii_colors[:char_index]
+    # Convert numpy arrays to lists for compatibility with the rest of the code
+    ascii_chars = ascii_chars[:char_index].tolist()
+    ascii_colors = ascii_colors[:char_index].tolist()
     
     # Clear GPU memory
     torch.cuda.empty_cache()
@@ -351,17 +382,46 @@ def create_ascii_frame(ascii_str, frame_index, total_frames, font, output_path, 
             create_ascii_frame.index_keys = torch.tensor(keys, device=DEVICE, dtype=torch.long)
             create_ascii_frame.index_values = torch.tensor(values, device=DEVICE, dtype=torch.long)
     
+    # Pre-calculate color mapping to avoid expensive calculations per character (just once)
+    if USE_COLOR and color_data is not None and not hasattr(create_ascii_frame, 'color_mapping'):
+        # Create a mapping from ascii_str index to color_data index
+        create_ascii_frame.color_mapping = {}
+        char_count = 0
+        
+        # For each character in ascii_str
+        for idx, char in enumerate(ascii_str):
+            if char != '\n':
+                # Map the ascii_str index to the color_data index
+                create_ascii_frame.color_mapping[idx] = char_count
+                char_count += 1
+    
     # Create the character mask using GPU acceleration
     char_mask = {}
     indices_numpy = indices_to_use.cpu().numpy()
     
-    # Process in batch for better GPU utilization
-    batch_size = 5000
-    for i in range(0, len(indices_numpy), batch_size):
-        batch_indices = indices_numpy[i:i+batch_size]
-        for idx in batch_indices:
-            if idx in create_ascii_frame.index_mapping:
-                char_mask[create_ascii_frame.index_mapping[idx]] = True
+    # Try to use a cached mask if available and we're in a memory-intensive segment
+    reuse_mask = False
+    if MEMORY_MANAGER_AVAILABLE and frame_index > total_frames * 0.5:  # Only in second half of frames
+        cached_mask = mm.get_cached_mask(frame_index, total_frames)
+        if cached_mask is not None:
+            char_mask = cached_mask
+            reuse_mask = True
+    
+    if not reuse_mask:
+        # Process in batch for better GPU utilization
+        batch_size = 10000  # Increased from 5000 for better throughput
+        for i in range(0, len(indices_numpy), batch_size):
+            batch_indices = indices_numpy[i:i+batch_size]
+            for idx in batch_indices:
+                if idx in create_ascii_frame.index_mapping:
+                    char_mask[create_ascii_frame.index_mapping[idx]] = True
+        
+        # Cache the mask for later reuse at strategic points
+        if MEMORY_MANAGER_AVAILABLE:
+            if (frame_index % 15 == 0 or  # Periodic caching
+                frame_index == total_frames or  # Cache the final frame
+                frame_index > total_frames * 0.8):  # Cache more in final segment
+                mm.cache_mask(frame_index, char_mask, total_frames)
     
     # Create blank canvas with dimensions to fit the entire TikTok screen
     img_width = int(TIKTOK_RESOLUTION[0])
@@ -391,10 +451,13 @@ def create_ascii_frame(ascii_str, frame_index, total_frames, font, output_path, 
             for char in line:
                 if char_index in char_mask:
                     if USE_COLOR and color_data is not None:
-                        # Use the original image color for this character
-                        color_idx = char_index - sum(1 for i in range(char_index) if ascii_str[i] == '\n')
-                        if 0 <= color_idx < len(color_data):
-                            text_color = color_data[color_idx]
+                        # Use pre-calculated color mapping
+                        if hasattr(create_ascii_frame, 'color_mapping') and char_index in create_ascii_frame.color_mapping:
+                            color_idx = create_ascii_frame.color_mapping[char_index]
+                            if 0 <= color_idx < len(color_data):
+                                text_color = color_data[color_idx]
+                            else:
+                                text_color = TEXT_COLOR
                         else:
                             text_color = TEXT_COLOR
                     else:
@@ -458,10 +521,13 @@ def create_ascii_frame(ascii_str, frame_index, total_frames, font, output_path, 
                 for char in line:
                     if char_index in char_mask:
                         if USE_COLOR and color_data is not None:
-                            # Use the original image color for this character
-                            color_idx = char_index - sum(1 for i in range(char_index) if ascii_str[i] == '\n')
-                            if 0 <= color_idx < len(color_data):
-                                color = color_data[color_idx]
+                            # Use pre-calculated color mapping
+                            if hasattr(create_ascii_frame, 'color_mapping') and char_index in create_ascii_frame.color_mapping:
+                                color_idx = create_ascii_frame.color_mapping[char_index]
+                                if 0 <= color_idx < len(color_data):
+                                    color = color_data[color_idx]
+                                else:
+                                    color = TEXT_COLOR
                             else:
                                 color = TEXT_COLOR
                         else:
@@ -505,10 +571,13 @@ def create_ascii_frame(ascii_str, frame_index, total_frames, font, output_path, 
                         current_line_text += char
                         
                         if USE_COLOR and color_data is not None:
-                            # Use the original image color for this character
-                            color_idx = char_index - sum(1 for i in range(char_index) if ascii_str[i] == '\n')
-                            if 0 <= color_idx < len(color_data):
-                                current_line_colors.append(color_data[color_idx])
+                            # Use pre-calculated color mapping
+                            if hasattr(create_ascii_frame, 'color_mapping') and char_index in create_ascii_frame.color_mapping:
+                                color_idx = create_ascii_frame.color_mapping[char_index]
+                                if 0 <= color_idx < len(color_data):
+                                    current_line_colors.append(color_data[color_idx])
+                                else:
+                                    current_line_colors.append(TEXT_COLOR)
                             else:
                                 current_line_colors.append(TEXT_COLOR)
                         else:
@@ -563,9 +632,30 @@ def create_ascii_frame(ascii_str, frame_index, total_frames, font, output_path, 
         # Free memory
         del img_np
     
-    # Clear GPU memory only if needed (not on each frame)
-    if frame_index % 10 == 0:
-        torch.cuda.empty_cache()
+    # As we progress through frames, we need less frequent memory clearing
+    # Early frames need more frequent clearing, later frames need less
+    if frame_index < total_frames * 0.3:
+        # Clear memory every 5 frames at the beginning
+        if frame_index % 5 == 0:
+            torch.cuda.empty_cache()
+    elif frame_index < total_frames * 0.7:
+        # Clear memory every 20 frames in the middle
+        if frame_index % 20 == 0:
+            torch.cuda.empty_cache()
+    else:
+        # Clear memory every 50 frames near the end
+        if frame_index % 50 == 0:
+            torch.cuda.empty_cache()
+    
+    # Final frame cleanup for late frames
+    if frame_index > total_frames * 0.85:
+        # For very late frames, we want to cleanup non-essential data to prevent memory bloat
+        # Clear any extra large data structures that aren't needed for rendering future frames
+        if hasattr(create_ascii_frame, 'index_values') and frame_index > total_frames * 0.95:
+            # In the final 5% of frames, we probably don't need these tensors anymore
+            # since all characters are likely to be visible
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 def process_frame_batch(ascii_art, frame_indices, total_frames, font, output_dir, color_data=None):
     """Process a batch of frames using GPU acceleration in a single process"""
@@ -610,9 +700,7 @@ def generate_frames(ascii_art, output_dir, total_frames=100, color_data=None):
     
     print(f"Total ASCII characters to render: {total_display_chars}")
     print(f"Animation style: {ANIMATION_STYLE}")
-    
-    # Configure GPU for maximum performance - single process approach
-    torch.cuda.set_per_process_memory_fraction(0.95)  # Use 95% of available VRAM for 8GB RTX 4060
+      # Configure GPU for maximum performance - single process approach    torch.cuda.set_per_process_memory_fraction(0.95)  # Use 95% of available VRAM for 8GB RTX 4060
     torch.cuda.empty_cache()  # Clear any existing allocations
     
     # Enable TensorFloat-32 (TF32) for Ampere/Ada architecture
@@ -620,21 +708,21 @@ def generate_frames(ascii_art, output_dir, total_frames=100, color_data=None):
     torch.backends.cudnn.allow_tf32 = True
     
     # Calculate optimal batch size for frame generation for 8GB VRAM
-    # For RTX 4060 with 8GB VRAM, use larger batches - but all in a single process
-    batch_size = 64  # Larger batch size for 8GB VRAM in single process
+    # Use adaptive batch sizing to prevent slowdown in later frames
+    batch_size = 48  # Base batch size - will be adjusted dynamically
     
     # Process frames in batches for better GPU utilization
-    print(f"Generating {total_frames} frames using pure GPU acceleration with batch size {batch_size}...")
+    print(f"Generating {total_frames} frames using pure GPU acceleration with adaptive batch sizing...")
     
     # Pre-cache indices and other data structures to avoid redundant calculations
     # This preparation will make the frame generation much faster
-    
-    # Initialize static data used by create_ascii_frame for all frames
+      # Initialize static data used by create_ascii_frame for all frames
     dummy_frame = os.path.join(output_dir, "dummy.png")
     create_ascii_frame(ascii_art, 0, total_frames, font, dummy_frame, color_data)
     if os.path.exists(dummy_frame):
         os.remove(dummy_frame)
-      # Calculate optimization level text for display
+    
+    # Calculate optimization level text for display
     opt_level_text = {
         0: "None (PIL, slowest)",
         1: "Basic (OpenCV, medium)",
@@ -653,10 +741,24 @@ def generate_frames(ascii_art, output_dir, total_frames=100, color_data=None):
     frames_processed = 0
     
     with tqdm(total=total_frames, desc="Generating frames") as pbar:
-        # Process in batches - all in a single process to avoid CUDA initialization overhead
-        for batch_idx in range(0, total_frames, batch_size):
+        # Process in batches with adaptive sizing
+        batch_idx = 0
+        while batch_idx < total_frames:
+            # Dynamically adjust batch size based on frame progress
+            # Later frames need smaller batches to prevent slowdown
+            progress_ratio = batch_idx / total_frames
+            if progress_ratio < 0.3:
+                # First third - use full batch size
+                current_batch_size = batch_size
+            elif progress_ratio < 0.7:
+                # Middle third - reduce batch size
+                current_batch_size = max(16, batch_size // 2)
+            else:
+                # Last third - use smallest batch size
+                current_batch_size = max(8, batch_size // 4)
+                
             batch_start_time = datetime.now()
-            end_idx = min(batch_idx + batch_size, total_frames)
+            end_idx = min(batch_idx + current_batch_size, total_frames)
             frame_indices = list(range(batch_idx, end_idx))
             
             # Generate the frames in this batch
@@ -665,11 +767,26 @@ def generate_frames(ascii_art, output_dir, total_frames=100, color_data=None):
                 create_ascii_frame(ascii_art, frame_index, total_frames, font, output_path, color_data)
                 pbar.update(1)
                 frames_processed += 1
+              # Clear CUDA cache with adaptive frequency
+            if progress_ratio < 0.3:
+                # Clear more often at the beginning
+                torch.cuda.empty_cache()
+            elif progress_ratio < 0.7:
+                # Clear less often in the middle
+                if batch_idx % 2 == 0:
+                    torch.cuda.empty_cache()
+            else:
+                # Clear rarely toward the end
+                if batch_idx % 4 == 0:
+                    torch.cuda.empty_cache()
+                    
+            # Reset memory pressure flag periodically to allow normal operation
+            if MEMORY_MANAGER_AVAILABLE and progress_ratio % 0.1 < 0.01:  # Every 10% of progress
+                mm.reset_memory_pressure()
             
-            # Only clear CUDA cache after each full batch
-            torch.cuda.empty_cache()
-            
-            # Calculate and display performance metrics every few batches
+            # Move to next batch
+            batch_idx = end_idx
+              # Calculate and display performance metrics every few batches
             if datetime.now() - last_update > timedelta(seconds=5):
                 elapsed = (datetime.now() - start_time).total_seconds()
                 fps = frames_processed / elapsed if elapsed > 0 else 0
@@ -681,10 +798,24 @@ def generate_frames(ascii_art, output_dir, total_frames=100, color_data=None):
                 estimated_seconds = frames_remaining / fps if fps > 0 else 0
                 estimated_time = timedelta(seconds=int(estimated_seconds))
                 
-                # Update progress bar description
+                # Update progress bar description with current batch size info
                 pbar.set_description(
-                    f"Generating frames [{fps:.1f} fps | {batch_fps:.1f} fps (current) | ETA: {estimated_time}]"
+                    f"Generating frames [{fps:.1f} fps | {batch_fps:.1f} fps | batch: {current_batch_size} | ETA: {estimated_time}]"
                 )
+                  # Dynamically reduce batch size if processing is slowing down
+                if batch_fps < fps * 0.7 and current_batch_size > 4:
+                    # If batch FPS drops significantly below overall FPS, reduce batch size
+                    next_batch_size = max(4, current_batch_size // 2)
+                    print(f"\nPerformance dropping - reducing batch size from {current_batch_size} to {next_batch_size}")
+                    batch_size = next_batch_size  # Update base batch size for next calculations
+                    
+                    # Signal memory pressure to both optimizers
+                    if PRERENDER_AVAILABLE:
+                        signal_memory_pressure()
+                    if MEMORY_MANAGER_AVAILABLE:
+                        mm.signal_memory_pressure()
+                    if MEMORY_MANAGER_AVAILABLE:
+                        mm.signal_memory_pressure()
                 
                 last_update = datetime.now()
     
@@ -732,6 +863,7 @@ def parse_args():
     parser.add_argument('--style', choices=['line', 'matrix', 'ants', 'random'], default='matrix',
                         help='Animation style for character revelation')
     parser.add_argument('--color', action='store_true', help='Use colors from the original image')
+    parser.add_argument('--no-color', action='store_true', help='Force black and white output (fastest rendering)')
     parser.add_argument('--duration', type=int, default=VIDEO_DURATION_SECONDS,
                         help='Duration of the video in seconds')
     parser.add_argument('--hold', type=float, default=HOLD_FINAL_FRAME_SECONDS,
@@ -746,40 +878,29 @@ def parse_args():
                         help='Font scale multiplier for OpenCV rendering (adjust for readability)')
     return parser.parse_args()
 
-def main():
-    print("=== ASCII Art Generator ===")
-
-    # Parse command line arguments
-    args = parse_args()
-      # Override global variables with arg values
-    global ANIMATION_STYLE, USE_COLOR, VIDEO_DURATION_SECONDS, HOLD_FINAL_FRAME_SECONDS, FPS
-    global OPTIMIZATION_LEVEL, FONT_SCALE_MULTIPLIER
-    ANIMATION_STYLE = args.style
-    USE_COLOR = args.color
-    VIDEO_DURATION_SECONDS = args.duration
-    HOLD_FINAL_FRAME_SECONDS = args.hold
-    FPS = args.fps
-    OPTIMIZATION_LEVEL = args.optimization_level
-    FONT_SCALE_MULTIPLIER = args.font_scale
+def process_single_image(image_file, input_dir, output_dir, output_path):
+    """Process a single image and generate the ASCII art video."""
+    input_image_path = os.path.join(input_dir, image_file)
+    print(f"\nProcessing image: {input_image_path}")
     
-    print(f"Animation style: {ANIMATION_STYLE}")
-    print(f"Use color: {USE_COLOR}")
-    print(f"Optimization level: {OPTIMIZATION_LEVEL}")
-
-    # Step 1: Get input image
-    image_files = [f for f in os.listdir(args.input_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-    if not image_files:
-        print(f"No images found in {args.input_dir}")
-        return
-
-    input_image_path = os.path.join(args.input_dir, image_files[0])
-    print(f"Using image: {input_image_path}")
-
-    # Step 2: Process image
+    # Get the file name without extension to use in output naming
+    file_name = os.path.splitext(image_file)[0]
+    # Create a unique output path for this image
+    if output_path == FINAL_VIDEO_PATH:  # Using default output path
+        this_output_path = f"ascii_video_{file_name}.mp4"
+    else:
+        # If a custom output was specified, add the filename before the extension
+        base, ext = os.path.splitext(output_path)
+        this_output_path = f"{base}_{file_name}{ext}"
+        
+    # Create a unique temporary frames directory for this image
+    this_output_dir = f"{output_dir}_{file_name}"
+    
+    # Process image
     try:
         image = Image.open(input_image_path)
     except Exception as e:
-        print(f"Error opening image: {e}")
+        print(f"Error opening image {image_file}: {e}")
         return
     
     # Calculate aspect ratio for resize
@@ -811,20 +932,79 @@ def main():
 
     # Step 3: Generate frames
     total_frames = FPS * VIDEO_DURATION_SECONDS
-    actual_frames = generate_frames(ascii_art, args.output_dir, total_frames, color_data)
+    actual_frames = generate_frames(ascii_art, this_output_dir, total_frames, color_data)
 
     # Step 4: Compile into video
-    temp_video = "temp_output.mp4"
-    create_video_from_frames(args.output_dir, temp_video)
+    temp_video = f"temp_output_{file_name}.mp4"
+    create_video_from_frames(this_output_dir, temp_video)
 
     # Step 5: Upscale to TikTok format
-    upscale_video(temp_video, args.output)
+    upscale_video(temp_video, this_output_path)
 
     # Clean up
     os.remove(temp_video)
-    print(f"✅ Done! Video ready for TikTok with {actual_frames} frames.")
-    print(f"Duration: approximately {actual_frames/FPS:.2f} seconds")
-    print(f"Output file: {args.output}")
+    # Optionally remove the frames directory if you don't need to keep them
+    # shutil.rmtree(this_output_dir)  # Uncomment to delete frame directories
+    
+    print(f"✅ Completed video for {image_file}!")
+    print(f"   Frames: {actual_frames}")
+    print(f"   Duration: approximately {actual_frames/FPS:.2f} seconds")
+    print(f"   Output file: {this_output_path}")
+    
+    return actual_frames, this_output_path
+
+
+def main():
+    print("=== ASCII Art Generator ===")
+
+    # Parse command line arguments
+    args = parse_args()
+      # Override global variables with arg values
+    global ANIMATION_STYLE, USE_COLOR, VIDEO_DURATION_SECONDS, HOLD_FINAL_FRAME_SECONDS, FPS
+    global OPTIMIZATION_LEVEL, FONT_SCALE_MULTIPLIER
+    ANIMATION_STYLE = args.style
+    
+    # Handle color settings - no-color takes precedence
+    if args.no_color:
+        USE_COLOR = False
+    else:
+        USE_COLOR = args.color
+        
+    VIDEO_DURATION_SECONDS = args.duration
+    HOLD_FINAL_FRAME_SECONDS = args.hold
+    FPS = args.fps
+    OPTIMIZATION_LEVEL = args.optimization_level
+    FONT_SCALE_MULTIPLIER = args.font_scale
+    
+    print(f"Animation style: {ANIMATION_STYLE}")
+    print(f"Use color: {USE_COLOR}")
+    print(f"Optimization level: {OPTIMIZATION_LEVEL}")
+
+    # Step 1: Get all input images
+    image_files = [f for f in os.listdir(args.input_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    if not image_files:
+        print(f"No images found in {args.input_dir}")
+        return
+    
+    print(f"Found {len(image_files)} images to process:")
+    for i, img in enumerate(image_files):
+        print(f"{i+1}. {img}")
+    
+    # Process each image and create a video for each
+    results = []
+    for image_file in image_files:
+        result = process_single_image(image_file, args.input_dir, args.output_dir, args.output)
+        if result:
+            results.append(result)
+    
+    # Summary
+    if results:
+        print("\n=== Processing Complete ===")
+        print(f"Successfully created {len(results)} ASCII art videos:")
+        for i, (frames, output_path) in enumerate(results):
+            print(f"{i+1}. {output_path} ({frames/FPS:.2f} seconds)")
+    else:
+        print("\nNo videos were successfully created.")
 
 if __name__ == "__main__":
     main()
